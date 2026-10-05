@@ -44,7 +44,9 @@ CREATE TABLE mold (
     status VARCHAR(16),
     storage_slot VARCHAR(32),
     note VARCHAR(64),
-    created_at DATETIME
+    created_at DATETIME,
+    CONSTRAINT chk_mold_life CHECK (used_count IS NULL OR (used_count >= 0
+        AND (life_count IS NULL OR used_count <= life_count)))
 );
 
 CREATE TABLE charge (

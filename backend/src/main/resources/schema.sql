@@ -109,7 +109,10 @@ CREATE TABLE mold (
     status VARCHAR(16),
     storage_slot VARCHAR(32),
     note VARCHAR(64),
-    created_at DATETIME
+    created_at DATETIME,
+    -- 寿命账实一致的最终防线：任何代码路径都不可能把已用次数扣到超过寿命上限或负数
+    CONSTRAINT chk_mold_life CHECK (used_count IS NULL OR (used_count >= 0
+        AND (life_count IS NULL OR used_count <= life_count)))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- ---------------- 铸件卡 ----------------

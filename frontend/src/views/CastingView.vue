@@ -14,6 +14,8 @@ const loading = ref(false)
 const dialog = ref(false)
 
 const heats = ref([])
+// 下拉里给【全部】模具（含已报废/超寿命），失效项禁用并注明原因；
+// 这只是页面提示，防止误选；真正的裁决在服务端（过期页面 / 重复请求仍会被后端原子拦截）
 const molds = ref([])
 const form = ref({
   castingNo: '', castingName: '', material: 'STAINLESS', heatId: null,
@@ -22,6 +24,39 @@ const form = ref({
 
 const routeQuery = computed(() => router.currentRoute.value?.query || {})
 const flowMode = computed(() => routeQuery.value.view === 'flow')
+
+/**
+ * 页面侧的模具可选判断（仅用于禁用/提示，不能作为安全边界）：
+ * 寿命耗尽/已报废、与当前所选材质不匹配都视为明显失效。
+ */
+function moldBlockReason(mold) {
+  if (!mold.schedulable) {
+    return mold.status === 'SCRAPPED' || mold.overLife
+      ? `寿命 ${mold.usedCount}/${mold.lifeCount} 已用完，${mold.statusName}`
+      : mold.statusName
+  }
+  if (mold.fitMaterial && form.value.material && mold.fitMaterial !== form.value.material) {
+    return `仅适用 ${mold.fitMaterialName}`
+  }
+  return ''
+}
+
+const chosenMold = computed(() => molds.value.find((m) => m.id === form.value.moldId) || null)
+const chosenMoldBlock = computed(() => (chosenMold.value ? moldBlockReason(chosenMold.value) : ''))
+
+function moldLabel(mold) {
+  const base = `${mold.moldNo} · ${mold.moldName || ''}（剩 ${mold.remainCount}/${mold.lifeCount} 次 · ${mold.statusName}）`
+  const block = moldBlockReason(mold)
+  return block ? `${base} —— ${block}` : base
+}
+
+// 切换材质后，已选模具若不再匹配适用材质，给出提示并清掉，避免带着明显失效选择去提交
+function onMaterialChange() {
+  if (chosenMold.value && moldBlockReason(chosenMold.value)) {
+    ElMessage.warning(`${chosenMold.value.moldNo} 不适用当前材质，已清空模具选择，请改选其他模具`)
+    form.value.moldId = null
+  }
+}
 
 const statusNameOf = computed(() => {
   const map = {}
@@ -67,14 +102,29 @@ async function move(status) {
 }
 
 async function createCasting() {
+  // 页面预检（与服务端同口径的明显失效选择），给出即时提示；服务端仍会独立全量校验
+  if (chosenMoldBlock.value) {
+    ElMessage.error(`所选模具不可用：${chosenMoldBlock.value}，请改选其他模具或刷新页面查看最新寿命`)
+    return
+  }
+  if (chosenMold.value) {
+    const cavityNo = Number(form.value.cavityNo)
+    if (!Number.isInteger(cavityNo) || cavityNo < 1 || cavityNo > chosenMold.value.cavityCount) {
+      ElMessage.error(`型腔号必须是 1～${chosenMold.value.cavityCount} 之间的整数（该模具共 ${chosenMold.value.cavityCount} 个型腔）`)
+      return
+    }
+  }
   loading.value = true
   try {
     await api.casting.create(form.value)
     ElMessage.success('铸件卡已建立')
     dialog.value = false
-    await loadList()
+    // 成功后重新拉取：末次寿命占用成功的模具会立即从可选项中消失（状态转报废）
+    await Promise.all([loadList(), refreshMolds()])
   } catch (e) {
     ElMessage.error(e.message)
+    // 失败（含末次寿命竞争失败/重复提交）后也要刷新，避免停留在过期页面再次提交同一失效选择
+    await Promise.all([loadList(), refreshMolds()]).catch(() => {})
   } finally {
     loading.value = false
   }
@@ -102,13 +152,17 @@ async function loadList() {
   materialStats.value = board.materialStats
 }
 
+// 全量模具（含失效项），用于建卡表单：失效项禁用并标注原因，可排产且材质匹配的才允许选中
+async function refreshMolds() {
+  molds.value = await api.mold.list()
+}
+
 async function load() {
   loading.value = true
   try {
     await loadList()
-    const [allHeats, usableMolds] = await Promise.all([api.smelt.heats(), api.mold.schedulable()])
+    const [allHeats] = await Promise.all([api.smelt.heats(), refreshMolds()])
     heats.value = allHeats.filter((h) => Number(h.tapWeight || 0) > 0)
-    molds.value = usableMolds
     selected.value = castings.value[0] ? await api.casting.get(castings.value[0].id) : null
   } catch (e) {
     ElMessage.error(e.message)
@@ -278,7 +332,10 @@ onMounted(load)
       <section class="panel">
         <div class="panel-title">建铸件卡</div>
         <el-button size="small" type="primary" plain @click="dialog = true">打开建档表单</el-button>
-        <div class="op-note">铸件卡必须挂在已出炉的炉次上，材质要与炉次一致；模具超寿命或被报废建档会被拦。</div>
+        <div class="op-note">
+          铸件卡必须挂在已出炉的炉次上，材质要与炉次一致；模具按适用材质与剩余寿命选择，型腔号须在型腔数范围内。
+          模具最后一次寿命由服务端原子占用：两人同时建卡只会成功一张，失败方按提示刷新即可看到真实结果，不要重复提交。
+        </div>
       </section>
     </div>
 
@@ -296,7 +353,7 @@ onMounted(load)
           </el-select>
         </el-form-item>
         <el-form-item label="材质">
-          <el-select v-model="form.material" style="width:100%">
+          <el-select v-model="form.material" style="width:100%" @change="onMaterialChange">
             <el-option label="灰铸铁 HT250" value="CAST_IRON" />
             <el-option label="球墨铸铁 QT450" value="DUCTILE_IRON" />
             <el-option label="铸造碳钢 ZG270" value="CARBON_STEEL" />
@@ -305,14 +362,28 @@ onMounted(load)
           </el-select>
         </el-form-item>
         <el-form-item label="模具">
-          <el-select v-model="form.moldId" clearable style="width:100%">
+          <el-select v-model="form.moldId" clearable style="width:100%" placeholder="不使用模具可留空">
             <el-option
               v-for="m in molds" :key="m.id"
-              :label="m.moldNo + ' · ' + m.moldName + '（剩 ' + m.remainCount + ' 次）'" :value="m.id"
+              :label="moldLabel(m)" :value="m.id"
+              :disabled="Boolean(moldBlockReason(m))"
             />
           </el-select>
+          <div v-if="chosenMold" class="mold-meta" :class="{ blocked: Boolean(chosenMoldBlock) }">
+            <template v-if="chosenMoldBlock">
+              <el-tag type="danger" size="small" effect="plain">不可用</el-tag>
+              {{ chosenMold.moldNo }}：{{ chosenMoldBlock }}（页面可能已过期，刷新后仍以服务端结果为准）
+            </template>
+            <template v-else>
+              剩余寿命 <b>{{ chosenMold.remainCount }}</b> / {{ chosenMold.lifeCount }} 次 ·
+              适用 {{ chosenMold.fitMaterialName || '不限' }} ·
+              {{ chosenMold.cavityCount }} 个型腔，型腔号填 1～{{ chosenMold.cavityCount }}
+            </template>
+          </div>
         </el-form-item>
-        <el-form-item label="型腔号"><el-input v-model="form.cavityNo" /></el-form-item>
+        <el-form-item label="型腔号">
+          <el-input v-model="form.cavityNo" :placeholder="chosenMold ? `1～${chosenMold.cavityCount}` : '型腔号'" />
+        </el-form-item>
         <el-form-item label="理论重量"><el-input-number v-model="form.theoryWeight" :min="0.1" :step="0.1" /></el-form-item>
         <el-form-item label="客户"><el-input v-model="form.customer" /></el-form-item>
         <el-form-item label="操作者"><el-input v-model="form.operator" /></el-form-item>
@@ -392,4 +463,13 @@ onMounted(load)
 
 .op-row { display: flex; gap: 8px; flex-wrap: wrap; }
 .op-note { margin-top: 8px; font-size: 11.5px; color: var(--ink-dim); line-height: 1.7; }
+
+.mold-meta {
+  margin-top: 5px;
+  font-size: 11.5px;
+  line-height: 1.7;
+  color: var(--ink-dim);
+}
+.mold-meta b { color: var(--primary-deep); }
+.mold-meta.blocked { color: #c0392b; }
 </style>

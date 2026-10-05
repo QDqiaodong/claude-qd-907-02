@@ -80,7 +80,8 @@ public class CastingService {
             throw new BizException("铸件编号不能为空");
         }
         if (castingRepository.existsByCastingNo(request.getCastingNo())) {
-            throw new BizException("铸件编号已存在：" + request.getCastingNo());
+            throw new BizException("铸件编号已存在：" + request.getCastingNo()
+                    + "（可能是重复提交，请勿重复建卡，请刷新页面查看已建立的铸件卡）");
         }
         if (!Dict.isValidMaterial(request.getMaterial())) {
             throw new BizException("材质非法，只能五选一：" + request.getMaterial());
@@ -102,20 +103,75 @@ public class CastingService {
             throw new BizException("铸件材质「" + Dict.materialName(request.getMaterial())
                     + "」与炉次 " + heat.getHeatNo() + " 的材质「" + Dict.materialName(heat.getAlloy()) + "」不一致");
         }
-        Mold mold = request.getMoldId() == null ? null
-                : moldRepository.findById(request.getMoldId())
-                        .orElseThrow(() -> new BizException("模具不存在：" + request.getMoldId()));
+
+        // 排产校验 + 寿命占用必须和铸件卡落库在同一个事务里原子完成：
+        // 先锁模具行（同模具并发建卡在此串行），再按锁内最新数据校验报废/寿命/适用材质/型腔，
+        // 然后由一条带剩余寿命条件的原子 UPDATE 占用一次寿命，最后才插入铸件卡。
+        // 任一步失败（业务校验不通过、原子占用竞争失败、铸件卡持久化异常）整个事务回滚：
+        // 既不会「寿命已扣但没有卡片」，也不会「卡片存在但寿命没扣」。
+        Mold mold = null;
+        if (request.getMoldId() != null) {
+            mold = moldService.lockForScheduling(request.getMoldId(), request.getMaterial());
+            checkCavity(mold, request.getCavityNo());
+            // 先占用末次寿命：数据库原子裁决，恰好把最后一次寿命留给本卡，模具当次转报废。
+            // 占用失败（竞争/报废/寿命耗尽）抛业务异常，后面的铸件卡不会插入，整个事务回滚。
+            moldService.consumeLocked(mold, request.getCastingNo());
+        }
 
         Casting casting = new Casting();
         apply(casting, request);
         casting.setStatus("WAIT_POUR");
         casting.setCreatedAt(LocalDateTime.now());
-        Casting saved = castingRepository.save(casting);
-        // 排产占用一次模具寿命（超寿命 / 报废模具在 consume 里拦）
-        if (mold != null) {
-            moldService.consume(mold.getId());
+        try {
+            return castingRepository.save(casting);
+        } catch (org.springframework.dao.DataIntegrityViolationException e) {
+            // 并发重复提交 / 过期页面重放：前置 existsByCastingNo 检查之后被别的事务抢先插入同一编号时，
+            // 铸件编号唯一约束给出最终裁决。翻译成明确业务失败；当前事务（含上面已占用的模具寿命）整体回滚，
+            // 不会留下「寿命扣了但卡没建」的半成品，失败方刷新即可看到先成功的那张卡。
+            // 只认唯一约束冲突（ANSI/H2 SQLState 23505；MySQL 23000 + 错误码 1062），
+            // 其它完整性异常（字段超长 22001、外键等）不是重复提交，保持原样抛出，不能误报成编号重复。
+            if (isUniqueViolation(e)) {
+                throw new BizException("铸件编号 " + request.getCastingNo()
+                        + " 已存在或该请求已被处理过（可能是重复提交/并发抢占），本笔建卡失败，请刷新页面查看已建立的铸件卡，不要重复提交");
+            }
+            throw e;
         }
-        return saved;
+    }
+
+    private static boolean isUniqueViolation(RuntimeException e) {
+        Throwable c = e;
+        while (c != null) {
+            if (c instanceof java.sql.SQLException sqlEx) {
+                String state = sqlEx.getSQLState();
+                if ("23505".equals(state) || ("23000".equals(state) && sqlEx.getErrorCode() == 1062)) {
+                    return true;
+                }
+            }
+            c = c.getCause();
+        }
+        return false;
+    }
+
+    /**
+     * 型腔信息校验：选用模具时必须给出型腔号，且型腔号必须是 1..型腔数 之间的整数。
+     * 校验失败直接抛业务异常，调用方事务回滚，模具次数不会被占用。
+     */
+    private void checkCavity(Mold mold, String cavityNo) {
+        if (!StringUtils.hasText(cavityNo)) {
+            throw new BizException("模具 " + mold.getMoldNo() + " 有 " + mold.getCavityCount()
+                    + " 个型腔，建卡必须填写型腔号");
+        }
+        int no;
+        try {
+            no = Integer.parseInt(cavityNo.trim());
+        } catch (NumberFormatException e) {
+            throw new BizException("型腔号必须是整数（1～"
+                    + (mold.getCavityCount() == null ? "?" : mold.getCavityCount()) + "）：" + cavityNo);
+        }
+        if (mold.getCavityCount() == null || no < 1 || no > mold.getCavityCount()) {
+            throw new BizException("模具 " + mold.getMoldNo() + " 只有 " + mold.getCavityCount()
+                    + " 个型腔，型腔号 " + cavityNo + " 超出范围（1～" + mold.getCavityCount() + "）");
+        }
     }
 
     @Transactional

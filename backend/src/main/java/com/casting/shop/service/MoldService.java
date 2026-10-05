@@ -108,23 +108,84 @@ public class MoldService {
         moldRepository.deleteById(id);
     }
 
-    /** 排产一次：已用次数 +1，超寿命直接拦 */
+    /**
+     * 建铸件卡排产前占用模具：先对模具行加排他锁，再按锁内最新数据做可排产校验。
+     *
+     * <p>同一模具的并发建卡在此锁上串行：先到事务提交（末次寿命被扣完、模具转报废）后，
+     * 后到事务才能拿到锁，并读到已提交的 used_count / status，从而被下面的校验明确挡回，
+     * 不会出现两笔排产都判断「还剩一次」的双占。</p>
+     *
+     * <p>本方法只加锁与校验，真正扣寿命在同事务内由
+     * {@link #consumeLocked(Mold, String)} 的原子 UPDATE 完成；
+     * 校验不满足时抛 {@link BizException}，调用方整个事务回滚，模具次数不变。</p>
+     *
+     * @param material 铸件材质，用于校验模具适用材质；为空表示不做材质比对
+     */
     @Transactional
-    public Mold consume(Long id) {
-        Mold mold = get(id);
+    public Mold lockForScheduling(Long moldId, String material) {
+        Long lockedId = moldRepository.lockRowById(moldId);
+        if (lockedId == null) {
+            throw new BizException("模具不存在：" + moldId);
+        }
+        // 加锁后再加载：必须读到锁内最新的已提交数据，不能用加锁前的旧快照
+        Mold mold = moldRepository.findById(moldId).orElseThrow(() -> new BizException("模具不存在：" + moldId));
+        checkSchedulable(mold);
+        if (StringUtils.hasText(mold.getFitMaterial())
+                && !mold.getFitMaterial().equals(material)) {
+            throw new BizException("模具 " + mold.getMoldNo() + " 的适用材质为「"
+                    + Dict.materialName(mold.getFitMaterial()) + "」，不能排产材质「"
+                    + Dict.materialName(material) + "」的铸件");
+        }
+        return mold;
+    }
+
+    /** 可排产校验：已报废 / 寿命已耗尽都不允许再排产（调用前模具行应已持有行锁） */
+    private void checkSchedulable(Mold mold) {
         if ("SCRAPPED".equals(mold.getStatus())) {
-            throw new BizException("模具 " + mold.getMoldNo() + " 已报废，禁止排产");
+            throw new BizException("模具 " + mold.getMoldNo() + " 已报废（寿命 "
+                    + mold.getLifeCount() + " 次已用完），禁止再排产，请刷新页面查看模具最新状态");
         }
         if (mold.isOverLife()) {
             throw new BizException("模具 " + mold.getMoldNo() + " 已用 " + mold.getUsedCount()
-                    + " / 寿命 " + mold.getLifeCount() + " 次，超寿命禁止排产");
+                    + " / 寿命 " + mold.getLifeCount() + " 次，剩余寿命为 0，禁止再排产，请刷新页面查看最新状态");
         }
-        mold.setUsedCount(mold.getUsedCount() + 1);
-        mold.setStatus("IN_USE");
-        if (mold.getUsedCount() >= mold.getLifeCount()) {
-            mold.setStatus("SCRAPPED");
+    }
+
+    /**
+     * 排产一次：原子占用一次模具寿命。
+     *
+     * <p>扣减是一条带剩余寿命条件的 UPDATE（{@link MoldRepository#consumeOnce}），
+     * 由数据库保证同一模具的并发排产最多成功一次；末次寿命扣减成功时模具当次转为 SCRAPPED，
+     * 立即进入不可再排产状态。竞争失败（末次寿命已被先到的排产占用）会得到明确业务失败。</p>
+     */
+    @Transactional
+    public Mold consume(Long id) {
+        Long lockedId = moldRepository.lockRowById(id);
+        if (lockedId == null) {
+            throw new BizException("模具不存在：" + id);
         }
-        return moldRepository.save(mold);
+        Mold before = moldRepository.findById(id).orElseThrow(() -> new BizException("模具不存在：" + id));
+        return consumeLocked(before, null);
+    }
+
+    /**
+     * 在调用方已持有模具行锁（见 {@link #lockForScheduling}）的前提下原子扣一次寿命。
+     * 条件 UPDATE 返回 0 只会发生在并发竞争失败（最后一次寿命已被别的事务占用），
+     * 此时抛出业务异常让整个建卡事务回滚——卡片不会落库，次数也不会多扣。
+     *
+     * @param mold       锁内加载的模具实体
+     * @param businessNo 关联业务单号（铸件编号），仅用于失败提示，可为空
+     */
+    @Transactional
+    public Mold consumeLocked(Mold mold, String businessNo) {
+        int updated = moldRepository.consumeOnce(mold.getId());
+        if (updated == 0) {
+            String suffix = businessNo == null ? "" : "（铸件卡 " + businessNo + " 未建立）";
+            throw new BizException("模具 " + mold.getMoldNo() + " 的剩余寿命刚被其他排产占用（寿命 "
+                    + mold.getLifeCount() + " 次已用完），本笔排产失败，请刷新页面查看最新结果" + suffix);
+        }
+        // consumeOnce 带 clearAutomatically，持久化上下文已清空，重新读取扣减后的真实状态
+        return moldRepository.findById(mold.getId()).orElseThrow();
     }
 
     /** 模具寿命进度环阵列：全部模具 + 按型壳类型的统计 */
