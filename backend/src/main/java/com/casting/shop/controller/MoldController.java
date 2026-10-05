@@ -60,7 +60,7 @@ public class MoldController {
         return ApiResponse.success("模具已更新", service.update(id, request));
     }
 
-    /** 排产一次：已用次数 +1（超寿命 / 报废会被拦） */
+    /** 排产一次：行锁内把已用次数 +1，最后一次用完立即报废 */
     @PostMapping("/{id}/consume")
     public ApiResponse<Mold> consume(@PathVariable Long id) {
         return ApiResponse.success("模具排产次数已累加", service.consume(id));

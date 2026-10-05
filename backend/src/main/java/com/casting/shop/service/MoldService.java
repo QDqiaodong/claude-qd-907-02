@@ -76,7 +76,13 @@ public class MoldService {
 
     @Transactional
     public Mold update(Long id, MoldRequest request) {
-        Mold mold = get(id);
+        // 与排产占用同一把行锁，避免人工改寿命与正在进行的建卡互相覆盖。
+        Long lockedId = moldRepository.lockRowById(id);
+        if (lockedId == null) {
+            throw new BizException("模具不存在：" + id);
+        }
+        Mold mold = moldRepository.findById(id)
+                .orElseThrow(() -> new BizException("模具不存在：" + id));
         if (StringUtils.hasText(request.getMoldNo()) && !request.getMoldNo().equals(mold.getMoldNo())
                 && moldRepository.existsByMoldNo(request.getMoldNo())) {
             throw new BizException("模具编号已存在：" + request.getMoldNo());
@@ -108,22 +114,35 @@ public class MoldService {
         moldRepository.deleteById(id);
     }
 
-    /** 排产一次：已用次数 +1，超寿命直接拦 */
+    /**
+     * 排产一次：先锁模具行，再把已用次数 +1。
+     *
+     * <p>最后一次寿命时，两笔并发请求不能同时通过 {@code used < life} 判断：
+     * 后到事务阻塞在 FOR UPDATE，等第一笔提交后读到的已是 life/life、SCRAPPED，只能业务失败。
+     * 本方法与铸件卡保存处于同一事务时，任何后续异常都会一起回滚。</p>
+     */
     @Transactional
     public Mold consume(Long id) {
-        Mold mold = get(id);
+        Long lockedId = moldRepository.lockRowById(id);
+        if (lockedId == null) {
+            throw new BizException("模具不存在：" + id);
+        }
+        Mold mold = moldRepository.findById(id)
+                .orElseThrow(() -> new BizException("模具不存在：" + id));
         if ("SCRAPPED".equals(mold.getStatus())) {
-            throw new BizException("模具 " + mold.getMoldNo() + " 已报废，禁止排产");
+            throw new BizException("模具 " + mold.getMoldNo() + " 已报废或寿命已用完，不能再排产，请刷新后改选其他模具");
         }
-        if (mold.isOverLife()) {
-            throw new BizException("模具 " + mold.getMoldNo() + " 已用 " + mold.getUsedCount()
-                    + " / 寿命 " + mold.getLifeCount() + " 次，超寿命禁止排产");
+        Integer lifeCount = mold.getLifeCount();
+        Integer usedCount = mold.getUsedCount() == null ? 0 : mold.getUsedCount();
+        if (lifeCount == null || lifeCount <= 0 || usedCount < 0) {
+            throw new BizException("模具 " + mold.getMoldNo() + " 的寿命数据异常，禁止排产");
         }
-        mold.setUsedCount(mold.getUsedCount() + 1);
-        mold.setStatus("IN_USE");
-        if (mold.getUsedCount() >= mold.getLifeCount()) {
-            mold.setStatus("SCRAPPED");
+        if (usedCount >= lifeCount) {
+            throw new BizException("模具 " + mold.getMoldNo() + " 剩余寿命已为 0（已用 "
+                    + usedCount + " / 寿命 " + lifeCount + "），请刷新后改选其他模具");
         }
+        mold.setUsedCount(usedCount + 1);
+        mold.setStatus(mold.getUsedCount() >= lifeCount ? "SCRAPPED" : "IN_USE");
         return moldRepository.save(mold);
     }
 

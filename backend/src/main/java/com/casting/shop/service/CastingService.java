@@ -18,6 +18,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Consumer;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
@@ -102,19 +103,45 @@ public class CastingService {
             throw new BizException("铸件材质「" + Dict.materialName(request.getMaterial())
                     + "」与炉次 " + heat.getHeatNo() + " 的材质「" + Dict.materialName(heat.getAlloy()) + "」不一致");
         }
-        Mold mold = request.getMoldId() == null ? null
-                : moldRepository.findById(request.getMoldId())
-                        .orElseThrow(() -> new BizException("模具不存在：" + request.getMoldId()));
+        if (request.getMoldId() == null) {
+            throw new BizException("铸件卡必须选择一套模具");
+        }
+        // 先锁模具行：适用材质 / 剩余寿命 / 型腔范围都以锁内最新数据判断。
+        // 两笔并发建卡在此串行，最后一次寿命只会被一张铸件卡占用。
+        Long lockedMoldId = moldRepository.lockRowById(request.getMoldId());
+        if (lockedMoldId == null) {
+            throw new BizException("模具不存在：" + request.getMoldId());
+        }
+        Mold mold = moldRepository.findById(request.getMoldId())
+                .orElseThrow(() -> new BizException("模具不存在：" + request.getMoldId()));
+        // 锁内复查编号：重复点击的第二笔请求可能在拿锁前已通过第一次检查。
+        if (castingRepository.existsByCastingNo(request.getCastingNo())) {
+            throw new BizException("铸件编号已存在：" + request.getCastingNo()
+                    + "（可能是重复请求已先提交成功），请刷新页面查看真实结果");
+        }
+        validateMoldForCasting(mold, request);
 
         Casting casting = new Casting();
         apply(casting, request);
         casting.setStatus("WAIT_POUR");
         casting.setCreatedAt(LocalDateTime.now());
-        Casting saved = castingRepository.save(casting);
-        // 排产占用一次模具寿命（超寿命 / 报废模具在 consume 里拦）
-        if (mold != null) {
-            moldService.consume(mold.getId());
+        Casting saved;
+        try {
+            saved = castingRepository.save(casting);
+        } catch (DataIntegrityViolationException e) {
+            String detail = e.getMostSpecificCause() == null ? ""
+                    : e.getMostSpecificCause().getMessage() == null ? ""
+                    : e.getMostSpecificCause().getMessage().toLowerCase();
+            if (detail.contains("duplicate") || detail.contains("unique") || detail.contains("casting_no")) {
+                // 并发重复请求可能同时越过 exists 检查，唯一键兜底时返回明确业务失败，不允许误以为排产失败又重试。
+                throw new BizException("铸件编号 " + request.getCastingNo()
+                        + " 已存在（可能是重复请求已先提交成功），请刷新页面查看真实结果");
+            }
+            throw e;
         }
+        // 铸件卡先落当前事务，再原子占用同一事务里的模具寿命；
+        // 占用失败或后续异常均由 @Transactional 回滚，不会留下孤卡或只扣寿命。
+        moldService.consume(mold.getId());
         return saved;
     }
 
@@ -221,6 +248,47 @@ public class CastingService {
         data.put("statusStats", castingRepository.statByStatus());
         data.put("materialStats", castingRepository.statByMaterial());
         return data;
+    }
+
+    private void validateMoldForCasting(Mold mold, CastingRequest request) {
+        if ("SCRAPPED".equals(mold.getStatus())) {
+            throw new BizException("模具 " + mold.getMoldNo() + " 已报废或寿命已用完，不能再排产，请刷新后改选其他模具");
+        }
+        int life = mold.getLifeCount() == null ? 0 : mold.getLifeCount();
+        int used = mold.getUsedCount() == null ? 0 : mold.getUsedCount();
+        if (life <= 0 || used < 0) {
+            throw new BizException("模具 " + mold.getMoldNo() + " 的寿命数据异常，禁止排产");
+        }
+        if (used >= life) {
+            throw new BizException("模具 " + mold.getMoldNo() + " 剩余寿命已为 0（已用 "
+                    + used + " / 寿命 " + life + "），请刷新后改选其他模具");
+        }
+        if (!StringUtils.hasText(mold.getFitMaterial())) {
+            throw new BizException("模具 " + mold.getMoldNo() + " 未维护适用材质，不能排产");
+        }
+        if (!mold.getFitMaterial().equals(request.getMaterial())) {
+            throw new BizException("模具 " + mold.getMoldNo() + " 仅适用于「"
+                    + Dict.materialName(mold.getFitMaterial()) + "」，与铸件材质「"
+                    + Dict.materialName(request.getMaterial()) + "」不匹配");
+        }
+        if (mold.getCavityCount() == null || mold.getCavityCount() <= 0) {
+            throw new BizException("模具 " + mold.getMoldNo() + " 的型腔数数据异常，禁止排产");
+        }
+        String cavityText = request.getCavityNo() == null ? "" : request.getCavityNo().trim();
+        if (!StringUtils.hasText(cavityText)) {
+            throw new BizException("型腔号不能为空");
+        }
+        int cavityNo;
+        try {
+            cavityNo = Integer.parseInt(cavityText);
+        } catch (NumberFormatException e) {
+            throw new BizException("型腔号必须是 1~" + mold.getCavityCount() + " 之间的数字");
+        }
+        if (cavityNo < 1 || cavityNo > mold.getCavityCount()) {
+            throw new BizException("模具 " + mold.getMoldNo() + " 只有 " + mold.getCavityCount()
+                    + " 个型腔，型腔号必须在 1~" + mold.getCavityCount() + " 之间");
+        }
+        request.setCavityNo(cavityText);
     }
 
     private void apply(Casting casting, CastingRequest request) {

@@ -17,11 +17,27 @@ const heats = ref([])
 const molds = ref([])
 const form = ref({
   castingNo: '', castingName: '', material: 'STAINLESS', heatId: null,
-  moldId: null, cavityNo: '1', theoryWeight: 12.4, customer: '', operator: '陈志远'
+  moldId: null, cavityNo: 1, theoryWeight: 12.4, customer: '', operator: '陈志远'
 })
 
 const routeQuery = computed(() => router.currentRoute.value?.query || {})
 const flowMode = computed(() => routeQuery.value.view === 'flow')
+
+const selectedMold = computed(() => molds.value.find((m) => m.id === form.value.moldId) || null)
+
+const moldInvalidReason = computed(() => {
+  const mold = selectedMold.value
+  if (!mold) return '请选择模具'
+  if (mold.status === 'SCRAPPED' || mold.overLife || mold.remainCount <= 0) {
+    return `${mold.moldNo} 已失效（剩余寿命 0 次），请刷新后改选其他模具`
+  }
+  if (mold.fitMaterial && mold.fitMaterial !== form.value.material) {
+    return `${mold.moldNo} 仅适用于 ${mold.fitMaterialName}，与当前铸件材质不匹配`
+  }
+  return ''
+})
+
+const cannotSubmit = computed(() => loading.value || Boolean(moldInvalidReason.value))
 
 const statusNameOf = computed(() => {
   const map = {}
@@ -67,14 +83,23 @@ async function move(status) {
 }
 
 async function createCasting() {
+  if (moldInvalidReason.value) {
+    ElMessage.warning(moldInvalidReason.value)
+    return
+  }
   loading.value = true
   try {
     await api.casting.create(form.value)
-    ElMessage.success('铸件卡已建立')
+    ElMessage.success('铸件卡已建立，模具寿命已同步占用')
     dialog.value = false
     await loadList()
+    // 成功后刷新模具剩余寿命，刚好用尽的模具会立即从可选项中失效。
+    await loadSchedulingOptions()
   } catch (e) {
     ElMessage.error(e.message)
+    // 页面可能过期，或另一笔并发请求已占用最后一次寿命；以服务端结果刷新，不能只依赖旧下拉框。
+    await loadSchedulingOptions()
+    await loadList()
   } finally {
     loading.value = false
   }
@@ -102,13 +127,18 @@ async function loadList() {
   materialStats.value = board.materialStats
 }
 
+async function loadSchedulingOptions() {
+  // 拉全部模具而不是只拉 schedulable：失效模具也要显示出来并明确禁用，便于识别过期页面里已选中的模具。
+  const [allHeats, allMolds] = await Promise.all([api.smelt.heats(), api.mold.list()])
+  heats.value = allHeats.filter((h) => Number(h.tapWeight || 0) > 0)
+  molds.value = allMolds
+}
+
 async function load() {
   loading.value = true
   try {
     await loadList()
-    const [allHeats, usableMolds] = await Promise.all([api.smelt.heats(), api.mold.schedulable()])
-    heats.value = allHeats.filter((h) => Number(h.tapWeight || 0) > 0)
-    molds.value = usableMolds
+    await loadSchedulingOptions()
     selected.value = castings.value[0] ? await api.casting.get(castings.value[0].id) : null
   } catch (e) {
     ElMessage.error(e.message)
@@ -278,7 +308,7 @@ onMounted(load)
       <section class="panel">
         <div class="panel-title">建铸件卡</div>
         <el-button size="small" type="primary" plain @click="dialog = true">打开建档表单</el-button>
-        <div class="op-note">铸件卡必须挂在已出炉的炉次上，材质要与炉次一致；模具超寿命或被报废建档会被拦。</div>
+        <div class="op-note">建卡要求炉次已出炉、铸件材质同时匹配炉次与模具适用材质、型腔号有效；最后一次寿命由后端加锁占用，失效按钮只是前端提示。</div>
       </section>
     </div>
 
@@ -305,21 +335,41 @@ onMounted(load)
           </el-select>
         </el-form-item>
         <el-form-item label="模具">
-          <el-select v-model="form.moldId" clearable style="width:100%">
+          <el-select v-model="form.moldId" style="width:100%">
             <el-option
-              v-for="m in molds" :key="m.id"
-              :label="m.moldNo + ' · ' + m.moldName + '（剩 ' + m.remainCount + ' 次）'" :value="m.id"
-            />
+              v-for="m in molds"
+              :key="m.id"
+              :label="m.moldNo + ' · ' + m.moldName + '（剩 ' + m.remainCount + ' 次 / 共 ' + m.lifeCount + ' 次）'"
+              :value="m.id"
+              :disabled="m.status === 'SCRAPPED' || m.overLife || m.remainCount <= 0"
+            >
+              <span>{{ m.moldNo }} · {{ m.moldName }}</span>
+              <span style="float:right;color:var(--ink-dim);font-size:12px">
+                {{ m.status === 'SCRAPPED' || m.remainCount <= 0 ? '已失效 · ' : '' }}剩 {{ m.remainCount }} 次
+              </span>
+            </el-option>
           </el-select>
+          <div v-if="selectedMold && !moldInvalidReason" class="mold-hint">
+            {{ selectedMold.moldNo }}：{{ selectedMold.fitMaterialName }} · {{ selectedMold.cavityCount }} 型腔 · 已用 {{ selectedMold.usedCount }}/{{ selectedMold.lifeCount }}
+          </div>
+          <div v-if="moldInvalidReason" class="mold-hint bad">{{ moldInvalidReason }}</div>
         </el-form-item>
-        <el-form-item label="型腔号"><el-input v-model="form.cavityNo" /></el-form-item>
+        <el-form-item label="型腔号">
+          <el-input-number
+            v-model="form.cavityNo"
+            :min="1"
+            :max="selectedMold?.cavityCount || 1"
+            controls-position="right"
+          />
+          <span class="field-hint">须在模具型腔数内；最终以后端锁内校验为准</span>
+        </el-form-item>
         <el-form-item label="理论重量"><el-input-number v-model="form.theoryWeight" :min="0.1" :step="0.1" /></el-form-item>
         <el-form-item label="客户"><el-input v-model="form.customer" /></el-form-item>
         <el-form-item label="操作者"><el-input v-model="form.operator" /></el-form-item>
       </el-form>
       <template #footer>
         <el-button @click="dialog = false">取消</el-button>
-        <el-button type="primary" :loading="loading" @click="createCasting">建立卡片</el-button>
+        <el-button type="primary" :loading="loading" :disabled="cannotSubmit" @click="createCasting">建立卡片</el-button>
       </template>
     </el-dialog>
   </div>
@@ -392,4 +442,7 @@ onMounted(load)
 
 .op-row { display: flex; gap: 8px; flex-wrap: wrap; }
 .op-note { margin-top: 8px; font-size: 11.5px; color: var(--ink-dim); line-height: 1.7; }
+.mold-hint { margin-top: 5px; font-size: 12px; color: var(--ink-dim); line-height: 1.5; }
+.mold-hint.bad { color: #c62828; font-weight: 700; }
+.field-hint { margin-left: 10px; color: var(--ink-dim); font-size: 12px; }
 </style>
